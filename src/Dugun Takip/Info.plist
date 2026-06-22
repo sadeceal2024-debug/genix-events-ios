@@ -3,7 +3,9 @@
 <plist version="1.0">
 <dict>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Capture Audio by user request</string>
+	<string>Microphone access is used by the voice assistant to add and manage your bookings by voice.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Speech recognition is used by the voice assistant to turn your spoken commands into bookings and actions.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Track current location by user request</string>
 	<key>NSCameraUsageDescription</key>

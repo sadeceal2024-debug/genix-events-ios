@@ -24,7 +24,7 @@ workflows:
       cocoapods: default
 
     scripts:
-      - name: Ensure Info.plist permission strings (camera/photo)
+      - name: Ensure Info.plist permission strings (camera/photo/mic/speech)
         script: |
           set -e
           # App hedefinin Info.plist'ini bul (Pods hariç)
@@ -37,8 +37,11 @@ workflows:
           setkey NSCameraUsageDescription "Camera access is used to take and attach photos to your events."
           setkey NSPhotoLibraryUsageDescription "Photo library access is used to attach photos to your events."
           setkey NSPhotoLibraryAddUsageDescription "Photo library access is used to save images and documents."
+          setkey NSMicrophoneUsageDescription "Microphone access is used by the voice assistant to add and manage your bookings by voice."
+          setkey NSSpeechRecognitionUsageDescription "Speech recognition is used by the voice assistant to turn your spoken commands into bookings and actions."
           echo "--- verify ---"
           pb "Print :NSCameraUsageDescription"; pb "Print :NSPhotoLibraryUsageDescription"
+          pb "Print :NSMicrophoneUsageDescription"; pb "Print :NSSpeechRecognitionUsageDescription"
 
       - name: Pod install
         script: |
