@@ -1,0 +1,104 @@
+# ============================================================
+#  GENİX iOS — Codemagic CI/CD  (Mac'siz build + App Store upload)
+#  Bu dosya her uygulamanın GitHub reposunun KÖKÜNE konur (codemagic.yaml).
+#  ⚠️ ile işaretli 4 değeri o uygulamaya göre değiştir.
+#  Automatic code signing = ASC API key ile → MacinCloud SSL engelini KOMPLE atlar.
+# ============================================================
+workflows:
+  ios-appstore:
+    name: Genix iOS App Store
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+
+    integrations:
+      app_store_connect: GENIX_ASC_KEY   # Codemagic UI'da eklediğin ASC API key entegrasyonunun ADI
+
+    environment:
+      groups:
+        - ios_signing            # Codemagic'te bu grupta: CERTIFICATE_PRIVATE_KEY_B64 (secure)
+      vars:
+        XCODE_WORKSPACE: "src/Dugun Takip.xcworkspace"
+        XCODE_SCHEME: "Dugun Takip"
+        APP_STORE_APPLE_ID: "0000000000"
+      xcode: latest
+      cocoapods: default
+
+    scripts:
+      - name: Ensure Info.plist permission strings (camera/photo)
+        script: |
+          set -e
+          # App hedefinin Info.plist'ini bul (Pods hariç)
+          PLIST=$(find . -name "Info.plist" -not -path "*/Pods/*" -not -path "*/build/*" | head -1)
+          echo "Info.plist: $PLIST"
+          pb() { /usr/libexec/PlistBuddy -c "$1" "$PLIST"; }
+          setkey() {
+            pb "Add :$1 string $2" 2>/dev/null || pb "Set :$1 $2"
+          }
+          setkey NSCameraUsageDescription "Camera access is used to take and attach photos to your events."
+          setkey NSPhotoLibraryUsageDescription "Photo library access is used to attach photos to your events."
+          setkey NSPhotoLibraryAddUsageDescription "Photo library access is used to save images and documents."
+          echo "--- verify ---"
+          pb "Print :NSCameraUsageDescription"; pb "Print :NSPhotoLibraryUsageDescription"
+
+      - name: Pod install
+        script: |
+          set -e
+          POD_DIR=$(dirname "$(find . -name Podfile | head -1)")
+          echo "Podfile dizini: $POD_DIR"
+          cd "$POD_DIR"
+          pod install --repo-update
+
+      - name: Code signing (create cert+profile from private key)
+        script: |
+          set -eo pipefail
+          echo "B64 uzunlugu: ${#CERTIFICATE_PRIVATE_KEY_B64}"
+          keychain initialize
+          printf '%s' "$CERTIFICATE_PRIVATE_KEY_B64" | openssl base64 -d -A > /tmp/cert_key.pem
+          echo "PEM boyutu: $(wc -c < /tmp/cert_key.pem) bayt"
+          grep -q "PRIVATE KEY" /tmp/cert_key.pem || { echo "HATA: private key bos/bozuk — Codemagic 'ios_signing' grubu + CERTIFICATE_PRIVATE_KEY_B64 secure degiskenini kontrol et"; exit 1; }
+          app-store-connect fetch-signing-files "com.genixsoft.events" --type IOS_APP_STORE --certificate-key @file:/tmp/cert_key.pem --create
+          keychain add-certificates
+          xcode-project use-profiles
+
+      - name: Auto-increment build number
+        script: |
+          set +e
+          LATEST=$(app-store-connect get-latest-testflight-build-number "$APP_STORE_APPLE_ID" 2>/dev/null)
+          if echo "$LATEST" | grep -qE '^[0-9]+$' && [ "$LATEST" -gt 0 ]; then
+            NEW=$(($LATEST + 1))
+          else
+            # Apple ID okunamadı/placeholder → zaman damgası (her zaman benzersiz ve artan)
+            NEW=$(date +%s)
+          fi
+          echo "Yeni build numarası: $NEW"
+          # CURRENT_PROJECT_VERSION'i pbxproj'a DOGRUDAN yaz (agvtool kirilgan: bosluklu klasor + versioning config)
+          find . -name "project.pbxproj" -not -path "*/Pods/*" -print0 | while IFS= read -r -d '' f; do
+            sed -i '' "s/CURRENT_PROJECT_VERSION = [^;]*;/CURRENT_PROJECT_VERSION = $NEW;/g" "$f"
+            echo "  guncellendi: $f"
+          done
+          echo "--- dogrulama ---"
+          grep -h "CURRENT_PROJECT_VERSION" $(find . -name "project.pbxproj" -not -path "*/Pods/*") | sort -u
+
+      - name: Build IPA
+        script: |
+          set +e
+          xcode-project build-ipa \
+            --workspace "$XCODE_WORKSPACE" \
+            --scheme "$XCODE_SCHEME"
+          RC=$?
+          if [ $RC -ne 0 ]; then
+            echo "==================== GENIX HATA DETAYI ===================="
+            grep -rhiE "error:|provisioning|aps-environment|no profile|doesn't include|requires a provisioning|signing|entitlement|code sign" /tmp/xcodebuild_logs/*.log 2>/dev/null | grep -viE "warning:|note:" | tail -50
+            echo "=========================================================="
+          fi
+          exit $RC
+
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true     # önce TestFlight (kendi iPhone'unda UI login + mic teyidi)
+        # submit_to_app_store: false   # otomatik App Review'a göndermek istersen aç
