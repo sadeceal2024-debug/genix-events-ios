@@ -19,7 +19,7 @@ workflows:
       vars:
         XCODE_WORKSPACE: "src/Dugun Takip.xcworkspace"
         XCODE_SCHEME: "Dugun Takip"
-        APP_STORE_APPLE_ID: "0000000000"
+        APP_STORE_APPLE_ID: "6782724668"
       xcode: latest
       cocoapods: default
 
