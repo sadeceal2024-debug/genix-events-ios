@@ -16,6 +16,7 @@ func createWebView(container: UIView, WKSMH: WKScriptMessageHandler, WKND: WKNav
     userContentController.add(WKSMH, name: "push-token")
     userContentController.add(WKSMH, name: "alkomutSpeech")
     userContentController.add(WKSMH, name: "iap")
+    userContentController.add(WKSMH, name: "biometricLock")
 
     config.userContentController = userContentController
 

@@ -3,6 +3,7 @@ import WebKit
 import Speech
 import AVFoundation
 import StoreKit
+import LocalAuthentication
 
 var webView: WKWebView! = nil
 
@@ -25,6 +26,11 @@ class ViewController: UIViewController, WKNavigationDelegate, UIDocumentInteract
     
     var htmlIsLoaded = false;
     private var loadingMode = LoadingMode.defaultCachePolicy
+
+    // ===== Face ID / Passcode (App Lock) =====
+    var genixLockOverlay: UIView?
+    var genixLockAuthInProgress = false
+    var genixNeedsUnlock = false   // authenticate only on a real background -> foreground transition
     
     private var themeObservation: NSKeyValueObservation?
     var currentWebViewTheme: UIUserInterfaceStyle = .unspecified
@@ -45,7 +51,15 @@ class ViewController: UIViewController, WKNavigationDelegate, UIDocumentInteract
         initToolbarView()
         loadRootUrl()
         if #available(iOS 15.0, *) { GenixIAP.shared.startObserving() }
-    
+
+        // If app lock is on, cover content immediately on launch and wait for auth.
+        // (Auth is triggered by sceneDidBecomeActive; the delayed call is a fallback.)
+        if genixAppLockEnabled() {
+            genixShowLock()
+            genixNeedsUnlock = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { self.genixAuthenticateIfNeeded() }
+        }
+
         NotificationCenter.default.addObserver(self, selector: #selector(self.keyboardWillHide(_:)), name: UIResponder.keyboardWillHideNotification , object: nil)
         
     }
@@ -282,6 +296,9 @@ extension ViewController: WKScriptMessageHandler {
         if message.name == "iap" {
             handleIAP(message)
         }
+        if message.name == "biometricLock" {
+            handleBiometricLock(message)
+        }
   }
 }
 
@@ -493,6 +510,215 @@ final class GenixIAP {
                 }
             }
             emit("status", ["ok": true, "active": active, "isActive": !active.isEmpty])
+        }
+    }
+}
+
+// ===== Face ID / Touch ID / Passcode (App Lock) — Genix Events =====
+// When the user turns this on in Settings, the app is locked with biometrics
+// on every launch/foreground. Policy .deviceOwnerAuthentication: if Face ID/
+// Touch ID fails, iOS AUTOMATICALLY falls back to the device passcode.
+// No password is stored; the existing web session stays signed in, so unlocking
+// brings the user straight into their account without typing a password.
+extension ViewController {
+
+    private static let genixLockKey = "genixAppLockEnabled"
+
+    func genixAppLockEnabled() -> Bool {
+        return UserDefaults.standard.bool(forKey: ViewController.genixLockKey)
+    }
+
+    private func genixKeyWindow() -> UIWindow? {
+        return UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+            .first { $0.isKeyWindow } ?? self.view.window
+    }
+
+    private func genixBiometryName() -> String {
+        let ctx = LAContext()
+        var err: NSError?
+        _ = ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err)
+        switch ctx.biometryType {
+        case .faceID:  return "Face ID"
+        case .touchID: return "Touch ID"
+        default:       return "Passcode"
+        }
+    }
+
+    // Notify the web layer: window.genixBiometricResult({...})
+    private func genixReplyBiometric(_ dict: [String: Any]) {
+        let json = (try? JSONSerialization.data(withJSONObject: dict))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        let js = "window.genixBiometricResult && window.genixBiometricResult(\(json));"
+        DispatchQueue.main.async {
+            DugunTakip.webView?.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
+
+    // Web bridge: enable / disable / state
+    func handleBiometricLock(_ message: WKScriptMessage) {
+        let body = message.body as? [String: Any] ?? [:]
+        let action = (body["action"] as? String) ?? "state"
+
+        switch action {
+        case "enable":
+            let ctx = LAContext()
+            var err: NSError?
+            if ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err) {
+                let bio = genixBiometryName()
+                ctx.evaluatePolicy(.deviceOwnerAuthentication,
+                                   localizedReason: "Verify your identity to turn on app lock") { ok, e in
+                    DispatchQueue.main.async {
+                        if ok {
+                            UserDefaults.standard.set(true, forKey: ViewController.genixLockKey)
+                            self.genixReplyBiometric(["action": "enable", "enabled": true, "available": true, "biometry": bio])
+                        } else {
+                            self.genixReplyBiometric(["action": "enable", "enabled": false, "available": true, "error": e?.localizedDescription ?? "cancelled"])
+                        }
+                    }
+                }
+            } else {
+                // Neither biometrics nor passcode configured on the device.
+                genixReplyBiometric(["action": "enable", "enabled": false, "available": false, "error": "no-auth"])
+            }
+
+        case "disable":
+            // Require authentication before turning off (prevents unauthorized disable).
+            let ctx = LAContext()
+            var err: NSError?
+            if ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err) {
+                ctx.evaluatePolicy(.deviceOwnerAuthentication,
+                                   localizedReason: "Verify your identity to turn off app lock") { ok, e in
+                    DispatchQueue.main.async {
+                        if ok {
+                            UserDefaults.standard.set(false, forKey: ViewController.genixLockKey)
+                            self.genixReplyBiometric(["action": "disable", "enabled": false, "available": true])
+                        } else {
+                            self.genixReplyBiometric(["action": "disable", "enabled": true, "available": true, "error": e?.localizedDescription ?? "cancelled"])
+                        }
+                    }
+                }
+            } else {
+                UserDefaults.standard.set(false, forKey: ViewController.genixLockKey)
+                genixReplyBiometric(["action": "disable", "enabled": false, "available": false])
+            }
+
+        default: // state
+            let ctx = LAContext()
+            var err: NSError?
+            let avail = ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err)
+            genixReplyBiometric(["action": "state", "enabled": genixAppLockEnabled(), "available": avail, "biometry": genixBiometryName()])
+        }
+    }
+
+    // Show the lock cover (opaque overlay — privacy on background + lock on launch).
+    func genixShowLock() {
+        if let existing = genixLockOverlay {
+            existing.isHidden = false
+            existing.superview?.bringSubviewToFront(existing)
+            return
+        }
+        // If the window is not ready yet (launch moment), attach to the VC view so
+        // content is never visible.
+        let container: UIView = genixKeyWindow() ?? self.view
+        let overlay = UIView(frame: container.bounds)
+        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        overlay.backgroundColor = UIColor(red: 0.07, green: 0.05, blue: 0.12, alpha: 1.0)
+        overlay.isUserInteractionEnabled = true
+
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.alignment = .center
+        stack.spacing = 18
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let icon = UIImageView(image: UIImage(systemName: "lock.fill"))
+        icon.tintColor = UIColor(red: 0.98, green: 0.55, blue: 0.72, alpha: 1.0)
+        icon.contentMode = .scaleAspectFit
+        NSLayoutConstraint.activate([icon.widthAnchor.constraint(equalToConstant: 54), icon.heightAnchor.constraint(equalToConstant: 54)])
+
+        let title = UILabel()
+        title.text = "Genix Events is locked"
+        title.textColor = .white
+        title.font = .systemFont(ofSize: 18, weight: .bold)
+
+        let btn = UIButton(type: .system)
+        btn.setTitle("  Unlock with \(genixBiometryName())  ", for: .normal)
+        btn.setTitleColor(.white, for: .normal)
+        btn.titleLabel?.font = .systemFont(ofSize: 16, weight: .bold)
+        btn.backgroundColor = UIColor(red: 0.86, green: 0.16, blue: 0.46, alpha: 1.0)
+        btn.layer.cornerRadius = 12
+        btn.contentEdgeInsets = UIEdgeInsets(top: 12, left: 22, bottom: 12, right: 22)
+        btn.addTarget(self, action: #selector(genixLockButtonTapped), for: .touchUpInside)
+
+        stack.addArrangedSubview(icon)
+        stack.addArrangedSubview(title)
+        stack.addArrangedSubview(btn)
+        overlay.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: overlay.centerYAnchor)
+        ])
+
+        container.addSubview(overlay)
+        genixLockOverlay = overlay
+    }
+
+    func genixHideLock() {
+        genixLockOverlay?.removeFromSuperview()
+        genixLockOverlay = nil
+    }
+
+    // Lock-screen button: manual retry (independent of the needsUnlock flag).
+    @objc func genixLockButtonTapped() {
+        genixRunBiometric()
+    }
+
+    // On background: cover immediately + set the flag so the next foreground authenticates.
+    func genixOnEnterBackground() {
+        guard genixAppLockEnabled() else { return }
+        genixShowLock()
+        genixNeedsUnlock = true
+    }
+
+    // On foreground/launch: authenticate ONLY if a lock is actually required.
+    // The Face ID sheet dismissal also fires sceneDidBecomeActive; at that point the
+    // flag is false, so we don't re-prompt -> no open/close loop.
+    func genixAuthenticateIfNeeded() {
+        guard genixAppLockEnabled(), genixNeedsUnlock else { return }
+        genixRunBiometric()
+    }
+
+    // Backward-compatible names (so SceneDelegate keeps working).
+    func genixApplyPrivacyShield() { genixOnEnterBackground() }
+    func genixPresentAuth() { genixAuthenticateIfNeeded() }
+
+    private func genixRunBiometric() {
+        guard genixAppLockEnabled() else { return }
+        if genixLockAuthInProgress { return }
+        genixShowLock()
+        genixLockAuthInProgress = true
+        genixNeedsUnlock = false   // auth started -> don't ask again for this foreground
+
+        let ctx = LAContext()
+        var err: NSError?
+        if ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err) {
+            ctx.evaluatePolicy(.deviceOwnerAuthentication,
+                               localizedReason: "Verify your identity to open Genix Events") { ok, _ in
+                DispatchQueue.main.async {
+                    self.genixLockAuthInProgress = false
+                    if ok {
+                        self.genixHideLock()
+                    }
+                    // failure/cancel -> stays locked; NO automatic retry (avoids a loop).
+                    // The user taps the button to retry.
+                }
+            }
+        } else {
+            // Cannot authenticate (e.g. passcode removed) -> unlock to avoid a permanent lockout.
+            genixLockAuthInProgress = false
+            genixHideLock()
         }
     }
 }
